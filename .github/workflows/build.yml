@@ -1,0 +1,385 @@
+name: Gerar APK Almoxarifado
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Configurar Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.x'
+          channel: 'stable'
+
+      - name: Criar projeto e instalar banco de dados
+        run: |
+          flutter create --platforms=android --org com.almoxarifado app_base
+          cp -r app_base/* .
+          cp -r app_base/.[!.]* . 2>/dev/null || true
+          rm -rf app_base
+          flutter pub add sqflite path
+
+      - name: Criar codigo do aplicativo de enderecamento
+        run: |
+          cat << 'EOF' > lib/database_helper.dart
+          import 'package:sqflite/sqflite.dart';
+          import 'package:path/path.dart';
+
+          class DatabaseHelper {
+            static final DatabaseHelper instance = DatabaseHelper._init();
+            static Database? _database;
+            DatabaseHelper._init();
+
+            Future<Database> get database async {
+              if (_database != null) return _database!;
+              _database = await _initDB('almoxarifado.db');
+              return _database!;
+            }
+
+            Future<Database> _initDB(String filePath) async {
+              final dbPath = await getDatabasesPath();
+              final path = join(dbPath, filePath);
+              return await openDatabase(path, version: 1, onCreate: _createDB);
+            }
+
+            Future _createDB(Database db, int version) async {
+              await db.execute('''
+                CREATE TABLE estoque (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  posicao TEXT NOT NULL,
+                  material TEXT NOT NULL,
+                  quantidade REAL NOT NULL,
+                  data_atualizacao TEXT NOT NULL
+                )
+              ''');
+              await db.execute('''
+                CREATE TABLE historico (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tipo TEXT NOT NULL,
+                  posicao TEXT NOT NULL,
+                  material TEXT NOT NULL,
+                  quantidade REAL NOT NULL,
+                  data_hora TEXT NOT NULL
+                )
+              ''');
+            }
+
+            Future<void> alocarMaterial(String posicao, String material, double qtd) async {
+              final db = await instance.database;
+              final posLimpa = posicao.trim().toUpperCase();
+              final matLimpo = material.trim().toUpperCase();
+              final agora = DateTime.now().toIso8601String();
+
+              final resultado = await db.query(
+                'estoque',
+                where: 'posicao = ? AND material = ?',
+                whereArgs: [posLimpa, matLimpo],
+              );
+
+              if (resultado.isNotEmpty) {
+                double qtdAtual = (resultado.first['quantidade'] as num).toDouble();
+                double novaQtd = qtdAtual + qtd;
+                await db.update(
+                  'estoque',
+                  {'quantidade': novaQtd, 'data_atualizacao': agora},
+                  where: 'posicao = ? AND material = ?',
+                  whereArgs: [posLimpa, matLimpo],
+                );
+              } else {
+                await db.insert('estoque', {
+                  'posicao': posLimpa,
+                  'material': matLimpo,
+                  'quantidade': qtd,
+                  'data_atualizacao': agora,
+                });
+              }
+
+              await db.insert('historico', {
+                'tipo': 'ENTRADA/ALOCACAO',
+                'posicao': posLimpa,
+                'material': matLimpo,
+                'quantidade': qtd,
+                'data_hora': agora,
+              });
+            }
+
+            Future<List<Map<String, dynamic>>> consultarPosicao(String posicao) async {
+              final db = await instance.database;
+              return await db.query(
+                'estoque',
+                where: 'posicao = ? AND quantidade > 0',
+                whereArgs: [posicao.trim().toUpperCase()],
+              );
+            }
+
+            Future<List<Map<String, dynamic>>> consultarMaterial(String material) async {
+              final db = await instance.database;
+              return await db.query(
+                'estoque',
+                where: 'material = ? AND quantidade > 0',
+                whereArgs: [material.trim().toUpperCase()],
+              );
+            }
+          }
+          EOF
+
+          cat << 'EOF' > lib/main.dart
+          import 'package:flutter/material.dart';
+          import 'database_helper.dart';
+
+          void main() {
+            runApp(const AlmoxarifadoApp());
+          }
+
+          class AlmoxarifadoApp extends StatelessWidget {
+            const AlmoxarifadoApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'Endereçamento Almoxarifado',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(
+                  primarySwatch: Colors.blueGrey,
+                  scaffoldBackgroundColor: const Color(0xFFF4F6F9),
+                ),
+                home: const TelaPrincipal(),
+              );
+            }
+          }
+
+          class TelaPrincipal extends StatefulWidget {
+            const TelaPrincipal({super.key});
+
+            @override
+            State<TelaPrincipal> createState() => _TelaPrincipalState();
+          }
+
+          class _TelaPrincipalState extends State<TelaPrincipal> {
+            int _abaSelecionada = 0;
+
+            final _posicaoController = TextEditingController();
+            final _materialController = TextEditingController();
+            final _qtdController = TextEditingController(text: '1');
+            final _buscaController = TextEditingController();
+
+            final _focoPosicao = FocusNode();
+            final _focoMaterial = FocusNode();
+            final _focoQtd = FocusNode();
+
+            List<Map<String, dynamic>> _resultadosBusca = [];
+            String _mensagemStatus = '';
+
+            @override
+            void dispose() {
+              _posicaoController.dispose();
+              _materialController.dispose();
+              _qtdController.dispose();
+              _buscaController.dispose();
+              _focoPosicao.dispose();
+              _focoMaterial.dispose();
+              _focoQtd.dispose();
+              super.dispose();
+            }
+
+            void _salvarAlocacao() async {
+              final pos = _posicaoController.text.trim();
+              final mat = _materialController.text.trim();
+              final qtd = double.tryParse(_qtdController.text.replaceAll(',', '.')) ?? 0;
+
+              if (pos.isEmpty || mat.isEmpty || qtd <= 0) {
+                setState(() {
+                  _mensagemStatus = 'Preencha posição, material e quantidade válida!';
+                });
+                return;
+              }
+
+              await DatabaseHelper.instance.alocarMaterial(pos, mat, qtd);
+
+              setState(() {
+                _mensagemStatus = 'Alocado com sucesso: $mat na pos $pos ($qtd un)';
+                _materialController.clear();
+                _qtdController.text = '1';
+              });
+
+              _focoMaterial.requestFocus();
+            }
+
+            void _buscarSaldo(bool porPosicao) async {
+              final termo = _buscaController.text.trim();
+              if (termo.isEmpty) return;
+
+              List<Map<String, dynamic>> res;
+              if (porPosicao) {
+                res = await DatabaseHelper.instance.consultarPosicao(termo);
+              } else {
+                res = await DatabaseHelper.instance.consultarMaterial(termo);
+              }
+
+              setState(() {
+                _resultadosBusca = res;
+              });
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('Endereçamento Almoxarifado', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  backgroundColor: const Color(0xFF1E293B),
+                ),
+                bottomNavigationBar: BottomNavigationBar(
+                  currentIndex: _abaSelecionada,
+                  selectedItemColor: Colors.blueAccent,
+                  onTap: (index) => setState(() => _abaSelecionada = index),
+                  items: const [
+                    BottomNavigationBarItem(icon: Icon(Icons.qr_code_scanner), label: 'Alocar Peça'),
+                    BottomNavigationBarItem(icon: Icon(Icons.search), label: 'Consultar Saldo'),
+                  ],
+                ),
+                body: _abaSelecionada == 0 ? _construirAbaAlocacao() : _construirAbaConsulta(),
+              );
+            }
+
+            Widget _construirAbaAlocacao() {
+              return SingleChildScrollView(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    TextField(
+                      controller: _posicaoController,
+                      focusNode: _focoPosicao,
+                      textInputAction: TextInputAction.next,
+                      decoration: const InputDecoration(
+                        labelText: '1. Posição / Endereço (Bipar)',
+                        border: OutlineInputBorder(),
+                        prefixIcon: Icon(Icons.location_on),
+                      ),
+                      onSubmitted: (_) => _focoMaterial.requestFocus(),
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: _materialController,
+                      focusNode: _focoMaterial,
+                      textInputAction: TextInputAction.next,
+                      decoration: const InputDecoration(
+                        labelText: '2. Código do Material (Bipar)',
+                        border: OutlineInputBorder(),
+                        prefixIcon: Icon(Icons.inventory_2),
+                      ),
+                      onSubmitted: (_) => _focoQtd.requestFocus(),
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: _qtdController,
+                      focusNode: _focoQtd,
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      textInputAction: TextInputAction.done,
+                      decoration: const InputDecoration(
+                        labelText: '3. Quantidade',
+                        border: OutlineInputBorder(),
+                        prefixIcon: Icon(Icons.format_list_numbered),
+                      ),
+                      onSubmitted: (_) => _salvarAlocacao(),
+                    ),
+                    const SizedBox(height: 20),
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        backgroundColor: const Color(0xFF0F766E),
+                      ),
+                      onPressed: _salvarAlocacao,
+                      icon: const Icon(Icons.check_circle, size: 28, color: Colors.white),
+                      label: const Text('CONFIRMAR ALOCAÇÃO', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
+                    ),
+                    const SizedBox(height: 16),
+                    if (_mensagemStatus.isNotEmpty)
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        color: Colors.blueGrey[100],
+                        child: Text(
+                          _mensagemStatus,
+                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _construirAbaConsulta() {
+              return Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  children: [
+                    TextField(
+                      controller: _buscaController,
+                      decoration: const InputDecoration(
+                        labelText: 'Bipar Posição ou Material para busca',
+                        border: OutlineInputBorder(),
+                        prefixIcon: Icon(Icons.search),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ElevatedButton(
+                            onPressed: () => _buscarSaldo(true),
+                            child: const Text('Ver Posição'),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: ElevatedButton(
+                            onPressed: () => _buscarSaldo(false),
+                            child: const Text('Ver Material'),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Expanded(
+                      child: _resultadosBusca.isEmpty
+                          ? const Center(child: Text('Nenhum registro exibido.'))
+                          : ListView.builder(
+                              itemCount: _resultadosBusca.length,
+                              itemBuilder: (context, i) {
+                                final item = _resultadosBusca[i];
+                                return Card(
+                                  margin: const EdgeInsets.symmetric(vertical: 4),
+                                  child: ListTile(
+                                    title: Text('Material: ${item['material']}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                                    subtitle: Text('Posição: ${item['posicao']}'),
+                                    trailing: Text('${item['quantidade']} un', style: const TextStyle(fontSize: 18, color: Colors.blue, fontWeight: FontWeight.bold)),
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Compilar APK
+        run: flutter build apk --debug
+
+      - name: Salvar instalador APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: coletor-enderecamento-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
